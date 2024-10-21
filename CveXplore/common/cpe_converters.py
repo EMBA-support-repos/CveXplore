@@ -1,10 +1,15 @@
-"""
-CPE Converters
-==============
-"""
 import re
 
 from CveXplore.database.helpers.cpe_conversion import cpe_uri_to_fs, cpe_fs_to_uri
+
+
+def split_cpe_name(cpename: str) -> list[str]:
+    """
+    Split CPE 2.3 into its components, accounting for escaped colons.
+    """
+    non_escaped_colon = r"(?<!\\):"
+    split_name = re.split(non_escaped_colon, cpename)
+    return split_name
 
 
 def from2to3CPE(cpe: str, autofill: bool = False) -> str:
@@ -17,7 +22,7 @@ def from2to3CPE(cpe: str, autofill: bool = False) -> str:
             return False
         cpe = cpe_uri_to_fs(cpe)
     if autofill:
-        e = cpe.split(":")
+        e = split_cpe_name(cpe)
         for x in range(0, 13 - len(e)):
             cpe += ":-"
     return cpe

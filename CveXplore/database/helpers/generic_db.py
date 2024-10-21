@@ -1,7 +1,3 @@
-"""
-Generic database functions
-==========================
-"""
 import re
 from functools import reduce
 from typing import Union, Iterable
@@ -38,7 +34,7 @@ class GenericDatabaseFactory(DatasourceConnection):
                 "typical_severity",
             ],
             "cpe": ["title", "cpeName", "vendor", "product", "stem"],
-            "cwe": ["name", "status", "Description"],
+            "cwe": ["name", "status", "description"],
             "cves": [
                 "cvss",
                 "cvss3",
@@ -56,15 +52,13 @@ class GenericDatabaseFactory(DatasourceConnection):
         }
 
         total_fields_list = (
-            self.__default_fields + self.__fields_mapping[self._collection]
+            self.__default_fields + self.__fields_mapping[self.collection]
         )
         for field in total_fields_list:
             setattr(
                 self,
                 field,
-                GenericDatabaseFieldsFunctions(
-                    field=field, collection=self._collection
-                ),
+                GenericDatabaseFieldsFunctions(field=field, collection=self.collection),
             )
 
     def get_by_id(self, doc_id: str):
@@ -78,7 +72,7 @@ class GenericDatabaseFactory(DatasourceConnection):
             except ValueError:
                 return "Provided value is not a string nor can it be cast to one"
 
-        return self._datasource_collection_connection.find_one({"id": doc_id})
+        return self.datasource_collection_connection.find_one({"id": doc_id})
 
     def mget_by_id(self, *doc_ids: str) -> Union[Iterable[CveXploreObject], Iterable]:
         """
@@ -106,7 +100,7 @@ class GenericDatabaseFactory(DatasourceConnection):
                     map(
                         lambda d: d.to_dict(),
                         [
-                            self._datasource_collection_connection.find_one(
+                            self.datasource_collection_connection.find_one(
                                 {"id": doc_id}
                             )
                         ],
@@ -139,7 +133,7 @@ class GenericDatabaseFactory(DatasourceConnection):
 
     def __repr__(self):
         """String representation of object"""
-        return f"<< GenericDatabaseFactory:{self._collection} >>"
+        return f"<< {self.__class__.__name__}:{self.collection} >>"
 
 
 class GenericDatabaseFieldsFunctions(DatasourceConnection):
@@ -164,7 +158,7 @@ class GenericDatabaseFieldsFunctions(DatasourceConnection):
 
         query = {self.__field: {"$regex": regex}}
 
-        return self._datasource_collection_connection.find(query)
+        return self.datasource_collection_connection.find(query)
 
     def find(self, value: str | dict = None):
         """
@@ -176,8 +170,8 @@ class GenericDatabaseFieldsFunctions(DatasourceConnection):
         else:
             query = None
 
-        return self._datasource_collection_connection.find(query)
+        return self.datasource_collection_connection.find(query)
 
     def __repr__(self):
         """String representation of object"""
-        return f"<< GenericDatabaseFieldsFunctions:{self._collection} >>"
+        return f"<< GenericDatabaseFieldsFunctions:{self.collection} >>"

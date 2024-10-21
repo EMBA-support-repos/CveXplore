@@ -1,8 +1,3 @@
-"""
-cpe
-===
-"""
-
 from pymongo import DESCENDING
 
 from CveXplore.common.cpe_converters import create_cpe_regex_string
@@ -32,7 +27,7 @@ class Cpe(DatasourceConnection):
 
         cpe_regex_string = create_cpe_regex_string(self.cpeName)
 
-        results = self._datasource_connection.store_cves.find(
+        results = self.datasource_connection.store_cves.find(
             {cpe_searchField: {"$regex": cpe_regex_string}}
         ).sort("cvss", DESCENDING)
 

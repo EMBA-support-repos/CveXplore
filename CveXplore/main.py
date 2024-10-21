@@ -1,13 +1,35 @@
-"""
-Main
-====
-"""
+import os
+import shutil
+
+from dotenv import load_dotenv
+
+if not os.path.exists(os.path.expanduser("~/.cvexplore")):
+    os.mkdir(os.path.expanduser("~/.cvexplore"))
+
+user_wd = os.path.expanduser("~/.cvexplore")
+
+if not os.path.exists(os.path.join(user_wd, ".env")):
+    shutil.copyfile(
+        os.path.join(os.path.dirname(__file__), "common/.env_example"),
+        os.path.join(user_wd, ".env"),
+    )
+
+load_dotenv(os.path.join(user_wd, ".env"))
+
+if not os.path.exists(os.path.join(user_wd, ".sources.ini")):
+    shutil.copyfile(
+        os.path.join(os.path.dirname(__file__), "common/.sources.ini"),
+        os.path.join(user_wd, ".sources.ini"),
+    )
+
 import functools
 import json
-import os
+import logging
+
 import re
+import warnings
 from collections import defaultdict
-from typing import List, Tuple, Union, Iterable
+from typing import List, Tuple, Union, Iterable, Type
 
 from pymongo import DESCENDING
 
@@ -15,91 +37,269 @@ from CveXplore.api.connection.api_db import ApiDatabaseSource
 from CveXplore.common.config import Configuration
 from CveXplore.common.cpe_converters import create_cpe_regex_string
 from CveXplore.common.db_mapping import database_mapping
-from CveXplore.database.connection.mongo_db import MongoDBConnection
-from CveXplore.database.maintenance.main_updater import MainUpdater
+from CveXplore.core.database_maintenance.main_updater import MainUpdater
+from CveXplore.core.general.datasources import supported_datasources
+from CveXplore.database.connection.database_connection import DatabaseConnection
 from CveXplore.errors import DatabaseIllegalCollection
+from CveXplore.errors.datasource import UnsupportedDatasourceException
 from CveXplore.errors.validation import CveNumberValidationError
 from CveXplore.objects.cvexplore_object import CveXploreObject
 
 try:
-    from version import VERSION
+    from CveXplore.core.celery_task_handler.task_handler import TaskHandler
 except ModuleNotFoundError:
+    # This is not a problem, because using the Celery backend is optional.
+    # This exception will be handled when loading the TaskHandler fails with
+    # a NameError, because we already have logging available there.
+    pass
+
+
+def _version():
     _PKG_DIR = os.path.dirname(__file__)
     version_file = os.path.join(_PKG_DIR, "VERSION")
     with open(version_file, "r") as fdsec:
         VERSION = fdsec.read()
 
+    return VERSION
+
+
+VERSION = __version__ = _version()
+
 
 class CveXplore(object):
     """
-    Main class for CveXplore package
+    The CveXplore class is the main entry point for CveXplore. All functionality is available from straight from this
+    class or via the different subclasses / attributes.
+
+    Group:
+        Main
     """
 
-    def __init__(
-        self,
-        mongodb_connection_details: dict = None,
-        api_connection_details: dict = None,
-    ):
+    def __init__(self, **kwargs):
         """
         Create a new instance of CveXplore
 
-        :param mongodb_connection_details: Provide the connection details needed to establish a connection to a mongodb
-                                           instance. The connection details should be in line with pymongo's
-                                           documentation.
-        :param api_connection_details: Provide the connection details needed to establish a connection to a cve-search
-                                       API provider. The cve-search API provider should allow access to the 'query' POST
-                                       endpoint; all other API endpoints are not needed for CveXplore to function. For
-                                       the connection details supported please check the :ref:`API connection <api>`
-                                       documentation.
+        Examples:
+
+            >>> from CveXplore import CveXplore
+            >>> cvx = CveXplore(datasource_type="mongodb", datasource_connection_details={"host": "mongodb://127.0.0.1:27017"})
+            >>> cvx.version
+            '0.1.2'
+
+            >>> from CveXplore import CveXplore
+            >>> cvx = CveXplore(datasource_type="api", datasource_connection_details={"address": ("mylocal.cve-search.int", 443), "api_path": "api"})
+            >>> cvx.version
+            '0.1.2'
+
+        Args:
+            kwargs['datasource_type']: Which datasource to query.
+            kwargs['datasource_connection_details']: Provide the connection details needed to establish a connection \
+            to the datasource. The connection details should be in line with the datasource's documentation.
+
         """
         self.__version = VERSION
-        self.config = Configuration()
+        self._config = Configuration
+        self.logger = logging.getLogger(__name__)
+
+        # adjust self.config with kwargs parameters; lower case parameters are converted to uppercase and then changed
+        # in the self.config object
+        for each in kwargs:
+            setattr(self.config, each.upper(), kwargs[each])
+
+        self._datasource_type = self.config.DATASOURCE_TYPE
+
+        self._datasource_connection_details = self.config.DATASOURCE_CONNECTION_DETAILS
+
+        self._mongodb_connection_details = self.config.MONGODB_CONNECTION_DETAILS
+        self._api_connection_details = self.config.API_CONNECTION_DETAILS
 
         os.environ["DOC_BUILD"] = json.dumps({"DOC_BUILD": "NO"})
 
-        if (
-            api_connection_details is not None
-            and mongodb_connection_details is not None
-        ):
-            raise ValueError(
-                "CveXplore can be used to connect to either a cve-search database OR a cve-search api, not both!"
+        self.logger.info(
+            f"Using {self.datasource_type} as datasource, connection details: {self.datasource_connection_details}"
+        )
+
+        if self.datasource_type not in supported_datasources:
+            raise UnsupportedDatasourceException(
+                f"Unsupported datasource selected: '{self.datasource_type}'; currently supported: {supported_datasources}"
             )
-        elif api_connection_details is None and mongodb_connection_details is None:
-            # by default assume we are talking to a database
-            mongodb_connection_details = {
-                "host": f"mongodb://{self.config.MONGODB_HOST}:{self.config.MONGODB_PORT}"
-            }
-            os.environ["MONGODB_CON_DETAILS"] = json.dumps(mongodb_connection_details)
-            self.datasource = MongoDBConnection(**mongodb_connection_details)
-            self.database = MainUpdater(datasource=self.datasource)
-        elif mongodb_connection_details is not None:
-            os.environ["MONGODB_CON_DETAILS"] = json.dumps(mongodb_connection_details)
-            self.datasource = MongoDBConnection(**mongodb_connection_details)
-            self.database = MainUpdater(datasource=self.datasource)
-        elif api_connection_details is not None:
-            api_connection_details["user_agent"] = f"CveXplore:{self.version}"
-            os.environ["API_CON_DETAILS"] = json.dumps(api_connection_details)
-            self.datasource = ApiDatabaseSource(**api_connection_details)
 
-        self.database_mapping = database_mapping
+        if self.datasource_type == "api" and self.datasource_connection_details is None:
+            raise ValueError(
+                "Missing datasource_connection_details for selected datasource ('api')"
+            )
+        elif self.datasource_type == "api":
+            self.datasource_connection_details["user_agent"] = (
+                f"CveXplore:{self.version}"
+            )
 
-        from CveXplore.database.helpers.generic_db import GenericDatabaseFactory
+        if (
+            self.mongodb_connection_details is not None
+            and self.datasource_type == "mongodb"
+        ):
+            self.logger.warning(
+                "The use of mongodb_connection_details is deprecated and will be removed in the 0.4 release, please "
+                "use datasource_connection_details instead"
+            )
+            self._datasource_connection_details = self.mongodb_connection_details
+        elif self.api_connection_details is not None and self.datasource_type == "api":
+            self.logger.warning(
+                "The use of api_connection_details is deprecated and will be removed in the 0.4 release, please "
+                "use datasource_connection_details instead"
+            )
+            self._datasource_connection_details = self.api_connection_details
+        else:
+            if self.datasource_type == "mongodb":
+                self._datasource_connection_details = {
+                    "host": (
+                        f"{self.config.DATASOURCE_PROTOCOL}://{self.config.DATASOURCE_HOST}:{self.config.DATASOURCE_PORT}"
+                        if self.config.DATASOURCE_USER is None
+                        and self.config.DATASOURCE_PASSWORD is None
+                        else f"{self.config.DATASOURCE_PROTOCOL}://{self.config.DATASOURCE_USER}:{self.config.DATASOURCE_PASSWORD}@{self.config.DATASOURCE_HOST}:{self.config.DATASOURCE_PORT}"
+                    ),
+                    "database": self.config.DATASOURCE_DBNAME,
+                }
+            elif self.datasource_type == "mysql":
+                self._datasource_connection_details = {
+                    "sql_uri": self.config.SQLALCHEMY_DATABASE_URI
+                }
+            elif self.datasource_type == "api":
+                self._datasource_connection_details = {
+                    "address": (
+                        f"{self.config.DATASOURCE_HOST}",
+                        int(f"{self.config.DATASOURCE_PORT}"),
+                    ),
+                    "api_path": "api",
+                }
+
+        setattr(
+            self.config,
+            "DATASOURCE_CONNECTION_DETAILS",
+            self.datasource_connection_details,
+        )
+
+        self.datasource = DatabaseConnection(
+            database_type=self.datasource_type,
+            database_init_parameters=self.datasource_connection_details,
+        ).database_connection
+        if self.datasource_type != "api":
+            self.database = MainUpdater(
+                datasource=self.datasource, datasource_type=self.datasource_type
+            )
+
+        self._database_mapping = database_mapping
+
         from CveXplore.database.helpers.specific_db import (
             CvesDatabaseFunctions,
             CpeDatabaseFunctions,
+            CapecDatabaseFunctions,
+            CWEDatabaseFunctions,
         )
 
-        for each in self.database_mapping:
-            try:
-                if each == "cves":
-                    setattr(self, each, CvesDatabaseFunctions(collection=each))
-                elif each == "cpe":
-                    setattr(self, each, CpeDatabaseFunctions(collection=each))
-                else:
-                    setattr(self, each, GenericDatabaseFactory(collection=each))
-            except KeyError:
-                # no specific or generic methods configured, skipping
-                continue
+        self.cves = CvesDatabaseFunctions(collection="cves")
+        self.cpe = CpeDatabaseFunctions(collection="cpe")
+        self.capec = CapecDatabaseFunctions(collection="capec")
+        self.cwe = CWEDatabaseFunctions(collection="cwe")
+
+        try:
+            self.task_handler = TaskHandler()
+        except NameError:
+            self.logger.info(
+                "Failed to load Celery TaskHandler; "
+                "continuing without the optional Celery backend."
+            )
+
+        self.logger.info(f"Initialized CveXplore version: {self.version}")
+
+    @property
+    def config(self) -> Type[Configuration]:
+        """
+        Returns Configuration object
+
+        Group:
+            Properties
+        """
+        return self._config
+
+    @property
+    def datasource_type(self) -> str:
+        """
+        Returns Datasource type
+
+        Group:
+            Properties
+        """
+        return self._datasource_type
+
+    @property
+    def datasource_connection_details(self) -> dict:
+        """
+        Returns Datasource Connection Details
+
+        Group:
+            Properties
+        """
+        return self._datasource_connection_details
+
+    @property
+    def database_mapping(self) -> dict:
+        """
+        Returns database mapping
+
+        Group:
+            Properties
+        """
+        return self._database_mapping
+
+    @property
+    def mongodb_connection_details(self) -> dict:
+        """
+        Returns Mongodb Connection Details
+
+        Group:
+            Properties
+        """
+        warnings.warn(
+            "The use of mongodb_connection_details is deprecated and will be removed in the 0.4 release, "
+            "please use datasource_connection_details instead",
+            DeprecationWarning,
+        )
+        return self._mongodb_connection_details
+
+    @property
+    def api_connection_details(self) -> dict:
+        """
+        Returns Api Connection Details
+
+        Group:
+            Properties
+        """
+        warnings.warn(
+            "The use of api_connection_details is deprecated and will be removed in the 0.4 release, please "
+            "use datasource_connection_details instead",
+            DeprecationWarning,
+        )
+        return self._api_connection_details
+
+    @property
+    def version(self) -> str:
+        """
+        Returns CveXplore version
+
+        Group:
+            Properties
+        """
+        return self.__version
+
+    @staticmethod
+    def where() -> str:
+        """
+        Request the path where CveXplore is installed
+
+        Returns:
+            Path where CveXplore is installed
+        """
+        return os.path.dirname(__file__)
 
     def get_single_store_entry(
         self, entry_type: str, dict_filter: dict = None
@@ -107,12 +307,26 @@ class CveXplore(object):
         """
         Method to perform a query on a *single* collection in the data source and return a *single* result.
 
-        Which specific store are you querying? Choices are:
-            - capec;
-            - cpe;
-            - cwe;
-            - via4;
-            - cves;
+        Examples:
+
+            >>> from CveXplore import CveXplore
+            >>> cvx = CveXplore()
+            >>> result = cvx.get_single_store_entry("capec", {"id": "1"})
+            >>> result
+            << Capec:1 >>
+
+        Args:
+            entry_type: Which specific store are you querying? Choices are:
+
+                                - capec;
+                                - cpe;
+                                - cwe;
+                                - via4;
+                                - cves;
+            dict_filter: a dictionary representing a filter according to pymongo documentation
+
+        Returns:
+            An instance of CveXploreObject or None
         """
 
         if dict_filter is None:
@@ -135,18 +349,43 @@ class CveXplore(object):
         """
         Method to perform a query on a *single* collection in the data source and return all the results.
 
-        Tuple which contains the entry_type and the dict_filter in a tuple.
-            Choices for entry_type:
-                - capec;
-                - cpe;
-                - cwe;
-                - via4;
-                - cves;
+        Examples:
 
-            dict_filter is a dictionary representing a filter according to pymongo documentation.
+           >>> from CveXplore import CveXplore
+           >>> cvx = CveXplore()
+           >>> result = cvx.get_single_store_entries(("cves", {"cvss": {"$eq": 8}}))
+           >>> result
+           [<< Cves:CVE-2011-0387 >>,
+           << Cves:CVE-2015-1935 >>,
+           << Cves:CVE-2014-3053 >>,
+           << Cves:CVE-2010-4031 >>,
+           << Cves:CVE-2016-1338 >>,
+           << Cves:CVE-2013-3633 >>,
+           << Cves:CVE-2017-14444 >>,
+           << Cves:CVE-2017-14446 >>,
+           << Cves:CVE-2017-14445 >>,
+           << Cves:CVE-2016-2354 >>]
 
-            example:
-                get_single_store_entries(("cwe", {"id": "78"}))
+           >>> from CveXplore import CveXplore
+           >>> cvx = CveXplore()
+           >>> result = cvx.get_single_store_entries(("cves", {"cvss": {"$eq": 8}}), limit=0)
+           >>> len(result)
+           32
+
+        Args:
+            query: Tuple which contains the entry_type and the dict_filter in a tuple. Choices for entry_type:
+
+                        - capec;
+                        - cpe;
+                        - cwe;
+                        - via4;
+                        - cves;
+
+                    dict_filter is a dictionary representing a filter according to pymongo documentation.
+            limit: Limit the number of results to return.
+
+        Returns:
+            A list with CveXploreObject's or None
         """
         if not isinstance(query, tuple):
             raise ValueError(
@@ -226,18 +465,28 @@ class CveXplore(object):
         Method to perform *multiple* queries on *a single* or *multiple* collections in the data source and return the
         results.
 
-        A list of tuples which contains the entry_type and the dict_filter.
-            Choices for entry_type:
-                - capec;
-                - cpe;
-                - cwe;
-                - via4;
-                - cves;
+        Examples:
 
-            dict_filter is a dictionary representing a filter according to pymongo documentation.
+            >>> from CveXplore import CveXplore
+            >>> cvx = CveXplore()
+            >>> result = cvx.get_multi_store_entries([("CWE", {"id": "78"}), ("cves", {"id": "CVE-2009-0018"})])
+            >>> result
+            [<< Cwe:78 >>, << Cves:CVE-2009-0018 >>]
 
-            example:
-                get_multi_store_entries([("cwe", {"id": "78"}), ("cves", {"id": "CVE-2009-0018"})])
+        Args:
+            queries: A list of tuples which contains the entry_type and the dict_filter. Choices for entry_type:
+
+                    - capec;
+                    - cpe;
+                    - cwe;
+                    - via4;
+                    - cves;
+
+                    dict_filter is a dictionary representing a filter according to pymongo documentation.
+            limit: Limit the number of results to return.
+
+        Returns:
+            A list with CveXploreObject's or None
         """
 
         results = map(
@@ -260,7 +509,18 @@ class CveXplore(object):
         """
         Method for retrieving Cves that match a single CPE string. By default, the search will be made matching
         the configuration fields of the cves documents.
-        CPE string could be formatted like: ``cpe:2.3:o:microsoft:windows_7:*:sp1:*:*:*:*:*:*``
+
+        Examples:
+
+            >>> from CveXplore import CveXplore
+            >>> cvx = CveXplore()
+            >>> cves = cvx.cves_for_cpe("cpe:2.3:o:microsoft:windows_7:*:sp1:*:*:*:*:*:*")
+
+        Args:
+            cpe_string: CPE string to search for.
+
+        Returns:
+            A list with CveXploreObject's or None
         """
 
         cpe_regex_string = create_cpe_regex_string(cpe_string)
@@ -272,7 +532,16 @@ class CveXplore(object):
 
         return cves
 
-    def _validate_cve_id(self, cve_id: str):
+    def _validate_cve_id(self, cve_id: str) -> str:
+        """
+        Method for validating a CVE ID.
+
+        Args:
+            cve_id: The CVE ID to validate.
+
+        Returns:
+            A validated CVE ID.
+        """
         reg_match = re.compile(r"[cC][vV][eE]-\d{4}-\d{4,10}")
         if reg_match.match(cve_id) is not None:
             cve_id = cve_id.upper()
@@ -291,7 +560,12 @@ class CveXplore(object):
     def cve_by_id(self, cve_id: str) -> CveXploreObject | None:
         """
         Method to retrieve a single CVE from the database by its CVE ID number.
-        The number format should be either CVE-2000-0001, cve-2000-0001 or 2000-0001.
+
+        Args:
+            cve_id: The number format should be either CVE-2000-0001, cve-2000-0001 or 2000-0001.
+
+        Returns:
+            A CveXploreObject or None
         """
         cve_id = self._validate_cve_id(cve_id=cve_id)
 
@@ -299,8 +573,13 @@ class CveXplore(object):
 
     def cves_by_id(self, *cve_ids: str) -> Union[Iterable[CveXploreObject], Iterable]:
         """
-        Method to retrieve a multiple CVE's from the database by its CVE ID number.
-        The number format should be either CVE-2000-0001, cve-2000-0001 or 2000-0001.
+        Method to retrieve multiple CVE's from the database by their CVE ID numbers.
+
+        Args:
+            cve_ids: The number format should be either CVE-2000-0001, cve-2000-0001 or 2000-0001.
+
+        Returns:
+            A list with CveXploreObject's or empty list
         """
         ret_data = []
         for cve_id in cve_ids:
@@ -313,9 +592,14 @@ class CveXplore(object):
 
     def capec_by_cwe_id(self, cwe_id: int) -> List[CveXploreObject] | None:
         """
-        Method to retrieve capecs related to a specific CWE ID
-        """
+        Method to retrieve CAPEC's related to a specific CWE ID
 
+        Args:
+            cwe_id: The CWE ID to retrieve CAPEC for.
+
+        Returns:
+            A list with CveXploreObject's or None
+        """
         cwe = self.get_single_store_entry("cwe", {"id": cwe_id})
 
         if cwe is not None:
@@ -325,9 +609,14 @@ class CveXplore(object):
 
     def last_cves(self, limit: int = 10) -> List[CveXploreObject] | None:
         """
-        Method to retrieve the last entered / changed cves. By default, limited to 10.
-        """
+        Method to retrieve the last entered / changed cves.
 
+        Args:
+            limit: The amount of results to return; defaults to 10.
+
+        Returns:
+            A list with CveXploreObject's or None
+        """
         results = (
             getattr(self.datasource, "store_cves")
             .find()
@@ -344,10 +633,12 @@ class CveXplore(object):
 
     def get_db_content_stats(self) -> dict | str:
         """
-        Property returning the stats from the database. Stats consist of the time last modified and the document count
+        This method request the statistics from the database and consist of the time last modified and the document count
         per cvedb store in the database.
-        """
 
+        Returns:
+            The stats from the database.
+        """
         stats = defaultdict(dict)
 
         if not isinstance(self.datasource, ApiDatabaseSource):
@@ -356,6 +647,9 @@ class CveXplore(object):
                 for each in results:
                     each.pop("_id")
                     db = each["db"]
+                    if db == "epss":
+                        continue
+
                     each.pop("db")
 
                     if "sources" in each:
@@ -382,11 +676,11 @@ class CveXplore(object):
 
         return f"Using api endpoint: {self.datasource.baseurl}"
 
-    @property
-    def version(self):
-        """Property returning current version"""
-        return self.__version
+    def __repr__(self) -> str:
+        """
+        String representation of object
 
-    def __repr__(self):
-        """String representation of object"""
+        Returns:
+            String representation of object
+        """
         return f"<< CveXplore:{self.version} >>"
